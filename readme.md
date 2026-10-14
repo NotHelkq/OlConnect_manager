@@ -14,7 +14,7 @@
 
 | Provider | Транспорты | Описание и статус |
 |---|---|---|
-| `openflux` | `auto`, `vyandex`, `yandex`, `mailru` | **Рекомендуемый.** L3 IP-туннель через Yandex Docs (Volga и классический редактор) и Mail.ru Docs. Не требует регистрации комнат. Поддерживает сквозное шифрование AES-256-GCM. Трафик защищён HTTPS доверенных облачных платформ. |
+| `openflux` | `auto`, `vyandex`, `yandex`, `mailru`, `avito`, `cups`, `telemost` | **Рекомендуемый.** L3 IP-туннель через сервисы документов (Yandex Volga/Docs, Mail.ru Docs), платформы лайв-кодинга (Avito Code, VK Cups.online) и Яндекс.Телемост. Не требует регистрации комнат. Поддерживает сквозное шифрование AES-256-GCM и обход SmartCaptcha. |
 | `telemost` | `vp8channel`, `videochannel` | WebRTC-сессии через Яндекс.Телемост с автоматической генерацией Room ID. |
 | `jitsi` | `vp8channel`, `datachannel`, `seichannel`, `videochannel` | Быстрый старт через публичные серверы Jitsi Meet (meet.jit.si и др.). |
 | `wbstream` | `vp8channel`, `datachannel` | WebRTC через WB Stream с поддержкой автоматизации авторизации в браузере. |

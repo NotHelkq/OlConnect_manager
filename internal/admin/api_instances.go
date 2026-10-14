@@ -282,6 +282,12 @@ func (s *Server) createInstance(w http.ResponseWriter, r *http.Request) {
 		if carrier == "openflux" {
 			if transport == "mailru" || strings.Contains(roomID, "mail.ru") {
 				name = "OpenFlux Mail.ru"
+			} else if transport == "avito" || strings.Contains(roomID, "avito.ru") {
+				name = "OpenFlux Avito"
+			} else if transport == "cups" || transport == "cupsonline" || strings.Contains(roomID, "cups.online") {
+				name = "OpenFlux Cups"
+			} else if transport == "telemost" || strings.Contains(roomID, "telemost.yandex.ru") {
+				name = "OpenFlux Telemost"
 			} else {
 				name = "OpenFlux Yandex"
 			}
@@ -861,6 +867,12 @@ func (s *Server) buildCompactURIWith(vals map[string]string, clientID string) st
 		if carrier == "openflux" {
 			if transport == "mailru" || strings.Contains(room, "mail.ru") {
 				name = "OpenFlux Mail.ru"
+			} else if transport == "avito" || strings.Contains(room, "avito.ru") {
+				name = "OpenFlux Avito"
+			} else if transport == "cups" || transport == "cupsonline" || strings.Contains(room, "cups.online") {
+				name = "OpenFlux Cups"
+			} else if transport == "telemost" || strings.Contains(room, "telemost.yandex.ru") {
+				name = "OpenFlux Telemost"
 			} else {
 				name = "OpenFlux Yandex"
 			}
@@ -873,6 +885,12 @@ func (s *Server) buildCompactURIWith(vals map[string]string, clientID string) st
 		host := "yandex"
 		if transport == "mailru" || strings.Contains(room, "mail.ru") {
 			host = "mailru"
+		} else if transport == "avito" || strings.Contains(room, "avito.ru") {
+			host = "avito"
+		} else if transport == "cups" || transport == "cupsonline" || strings.Contains(room, "cups.online") {
+			host = "cups"
+		} else if transport == "telemost" || strings.Contains(room, "telemost.yandex.ru") {
+			host = "telemost"
 		}
 		uri := fmt.Sprintf("openflux://%s?url=%s", host, url.QueryEscape(room))
 		if transport != "" && transport != "auto" {
@@ -936,6 +954,12 @@ func (s *Server) buildURIWith(vals map[string]string, clientID string) string {
 		if carrier == "openflux" {
 			if transport == "mailru" || strings.Contains(room, "mail.ru") {
 				name = "OpenFlux Mail.ru"
+			} else if transport == "avito" || strings.Contains(room, "avito.ru") {
+				name = "OpenFlux Avito"
+			} else if transport == "cups" || transport == "cupsonline" || strings.Contains(room, "cups.online") {
+				name = "OpenFlux Cups"
+			} else if transport == "telemost" || strings.Contains(room, "telemost.yandex.ru") {
+				name = "OpenFlux Telemost"
 			} else {
 				name = "OpenFlux Yandex"
 			}
@@ -948,6 +972,12 @@ func (s *Server) buildURIWith(vals map[string]string, clientID string) string {
 		host := "yandex"
 		if transport == "mailru" || strings.Contains(room, "mail.ru") {
 			host = "mailru"
+		} else if transport == "avito" || strings.Contains(room, "avito.ru") {
+			host = "avito"
+		} else if transport == "cups" || transport == "cupsonline" || strings.Contains(room, "cups.online") {
+			host = "cups"
+		} else if transport == "telemost" || strings.Contains(room, "telemost.yandex.ru") {
+			host = "telemost"
 		}
 		uri := fmt.Sprintf("openflux://%s?url=%s", host, url.QueryEscape(room))
 		if transport != "" && transport != "auto" {

@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO="Oleglog/OlConnect_manager"
 # Fallback release used only when the latest tag cannot be resolved from GitHub.
-INSTALLER_VERSION="2.3.5"
+INSTALLER_VERSION="2.3.6"
 RELEASE_TAG=""
 RELEASE_VERSION=""
 CARRIER_DEFAULT="jitsi"
@@ -513,8 +513,13 @@ else
 # olcRTC server launcher (refactor-universal-carrier branch).
 set -euo pipefail
 
+CONFIG_FILE="./config.yaml"
+
 carrier="${OLCRTC_CARRIER:-${OLCRTC_PROVIDER:-}}"
+# Backward compat: wb_stream -> wbstream, jazz/salutejazz -> jitsi
 [ "$carrier" = "wb_stream" ] && carrier="wbstream"
+[ "$carrier" = "jazz" ] && carrier="jitsi"
+[ "$carrier" = "salutejazz" ] && carrier="jitsi"
 
 if [ "$carrier" = "openflux" ]; then
     echo "Starting openflux exit node for document: ${OLCRTC_ROOM_ID}"
@@ -590,6 +595,12 @@ if [ "$carrier" = "openflux" ]; then
     if [ "$t" = "auto" ] || [ -z "$t" ]; then
         if [[ "${OLCRTC_ROOM_ID}" == *"mail.ru"* ]]; then
             t="mailru"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"avito.ru"* ]]; then
+            t="avito"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"cups.online"* ]]; then
+            t="cups"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"telemost.yandex.ru"* ]]; then
+            t="telemost"
         else
             t="yandex"
         fi

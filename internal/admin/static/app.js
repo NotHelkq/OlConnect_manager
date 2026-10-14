@@ -77,7 +77,7 @@ function toggleTheme() {
 function compatibleTransports(carrier) {
   if (carrier === 'telemost' || carrier === 'wbstream') return ['vp8channel'];
   if (carrier === 'jitsi') return ['datachannel'];
-  if (carrier === 'openflux') return ['auto', 'vyandex', 'yandex', 'mailru'];
+  if (carrier === 'openflux') return ['auto', 'vyandex', 'yandex', 'mailru', 'avito', 'cups', 'telemost'];
   return ['vp8channel', 'datachannel'];
 }
 
@@ -2511,6 +2511,12 @@ function showCreateInstanceModal() {
       const room = roomIDField.input.value.trim();
       if (finalTransport === 'mailru' || room.includes('mail.ru')) {
         nameField.input.value = 'OpenFlux Mail.ru';
+      } else if (finalTransport === 'avito' || room.includes('avito.ru')) {
+        nameField.input.value = 'OpenFlux Avito';
+      } else if (finalTransport === 'cups' || finalTransport === 'cupsonline' || room.includes('cups.online')) {
+        nameField.input.value = 'OpenFlux Cups';
+      } else if (finalTransport === 'telemost' || room.includes('telemost.yandex.ru')) {
+        nameField.input.value = 'OpenFlux Telemost';
       } else {
         nameField.input.value = 'OpenFlux Yandex';
       }
@@ -2859,6 +2865,12 @@ function showConfigModal(inst) {
       const t = transportField.input.value;
       if (t === 'mailru' || room.includes('mail.ru')) {
         nameField.input.value = 'OpenFlux Mail.ru';
+      } else if (t === 'avito' || room.includes('avito.ru')) {
+        nameField.input.value = 'OpenFlux Avito';
+      } else if (t === 'cups' || t === 'cupsonline' || room.includes('cups.online')) {
+        nameField.input.value = 'OpenFlux Cups';
+      } else if (t === 'telemost' || room.includes('telemost.yandex.ru')) {
+        nameField.input.value = 'OpenFlux Telemost';
       } else {
         nameField.input.value = 'OpenFlux Yandex';
       }
@@ -2878,6 +2890,12 @@ function showConfigModal(inst) {
       const room = roomIDField.input.value.trim();
       if (t === 'mailru' || room.includes('mail.ru')) {
         nameField.input.value = 'OpenFlux Mail.ru';
+      } else if (t === 'avito' || room.includes('avito.ru')) {
+        nameField.input.value = 'OpenFlux Avito';
+      } else if (t === 'cups' || t === 'cupsonline' || room.includes('cups.online')) {
+        nameField.input.value = 'OpenFlux Cups';
+      } else if (t === 'telemost' || room.includes('telemost.yandex.ru')) {
+        nameField.input.value = 'OpenFlux Telemost';
       } else {
         nameField.input.value = 'OpenFlux Yandex';
       }

@@ -128,6 +128,12 @@ if [ "$carrier" = "openflux" ]; then
     if [ "$t" = "auto" ] || [ -z "$t" ]; then
         if [[ "${OLCRTC_ROOM_ID}" == *"mail.ru"* ]]; then
             t="mailru"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"avito.ru"* ]]; then
+            t="avito"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"cups.online"* ]]; then
+            t="cups"
+        elif [[ "${OLCRTC_ROOM_ID}" == *"telemost.yandex.ru"* ]]; then
+            t="telemost"
         else
             t="yandex"
         fi
