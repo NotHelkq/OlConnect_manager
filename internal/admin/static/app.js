@@ -76,7 +76,7 @@ function toggleTheme() {
 // OlcrtcProfile.supports() on Android.
 function compatibleTransports(carrier) {
   if (carrier === 'telemost' || carrier === 'wbstream') return ['vp8channel'];
-  if (carrier === 'jitsi') return ['datachannel'];
+  if (carrier === 'jitsi' || carrier === 'vk') return ['datachannel'];
   if (carrier === 'openflux') return ['auto', 'vyandex', 'yandex', 'mailru', 'avito', 'cups', 'telemost'];
   return ['vp8channel', 'datachannel'];
 }
@@ -2307,7 +2307,7 @@ function showCreateInstanceModal() {
   connectionSec.appendChild(connTitle);
   const connGrid = el('div', 'grid grid-cols-1 md:grid-cols-2 gap-3');
 
-  const carrierField = makeSelectField('Провайдер', icon('tag', 14), 'jitsi', ['jitsi', 'telemost', 'wbstream', 'openflux']);
+  const carrierField = makeSelectField('Провайдер', icon('tag', 14), 'jitsi', ['jitsi', 'telemost', 'wbstream', 'openflux', 'vk']);
   // Issue #52: seichannel/videochannel are dead on this project; datachannel
   // works only with jitsi. Compatible options per carrier:
   // telemost/wbstream -> vp8channel, jitsi -> datachannel.
@@ -2521,7 +2521,7 @@ function showCreateInstanceModal() {
         nameField.input.value = 'OpenFlux Yandex';
       }
     } else {
-      const carriers = { jitsi: 'jitsi', telemost: 'telemost', wbstream: 'wbstream' };
+      const carriers = { jitsi: 'jitsi', telemost: 'telemost', wbstream: 'wbstream', vk: 'vk' };
       const cp = carriers[c] || c;
       nameField.input.value = cp + '_olcrtc' + (finalTransport && finalTransport !== 'vp8channel' ? '_' + finalTransport : '');
     }
@@ -2603,7 +2603,7 @@ function showConfigModal(inst) {
   connectionSec.appendChild(connTitle);
   const connGrid = el('div', 'grid grid-cols-1 md:grid-cols-2 gap-3');
 
-  const carrierField = makeSelectField('Провайдер', icon('tag', 14), inst.carrier || 'jitsi', ['jitsi', 'telemost', 'wbstream', 'openflux']);
+  const carrierField = makeSelectField('Провайдер', icon('tag', 14), inst.carrier || 'jitsi', ['jitsi', 'telemost', 'wbstream', 'openflux', 'vk']);
   const transportField = makeSelectField('Транспорт', icon('wifi', 14), inst.transport || 'vp8channel', getTransportOptions(inst.carrier || 'jitsi'));
   const nameField = makeInputField('Имя', icon('tag', 14), inst.name || '', { placeholder: 'имя инстанса' });
   const roomIDField = makeInputField('Room ID', icon('tag', 14), inst.room_id || '', { placeholder: 'jitsi: https://meet.small-dm.ru/yourroom · wbstream: создать на stream.wb.ru' });
@@ -2874,7 +2874,7 @@ function showConfigModal(inst) {
       } else {
         nameField.input.value = 'OpenFlux Yandex';
       }
-    } else if (/^(jitsi|telemost|wbstream)_olcrtc/.test(curName) || /^OpenFlux/.test(curName) || curName === '') {
+    } else if (/^(jitsi|telemost|wbstream|vk)_olcrtc/.test(curName) || /^OpenFlux/.test(curName) || curName === '') {
       const t = transportField.input.value;
       nameField.input.value = carrierPrefix + '_olcrtc' + (t && t !== 'vp8channel' ? '_' + t : '');
     }
@@ -2883,7 +2883,7 @@ function showConfigModal(inst) {
   function updateNameFromTransport() {
     const c = carrierField.input.value;
     const t = transportField.input.value;
-    const carriers = { jitsi: 'jitsi', telemost: 'telemost', wbstream: 'wbstream' };
+    const carriers = { jitsi: 'jitsi', telemost: 'telemost', wbstream: 'wbstream', vk: 'vk' };
     const carrierPrefix = carriers[c] || c;
     const curName = nameField.input.value;
     if (c === 'openflux') {
@@ -2899,7 +2899,7 @@ function showConfigModal(inst) {
       } else {
         nameField.input.value = 'OpenFlux Yandex';
       }
-    } else if (/^(jitsi|telemost|wbstream)_olcrtc/.test(curName) || /^OpenFlux/.test(curName) || curName === '') {
+    } else if (/^(jitsi|telemost|wbstream|vk)_olcrtc/.test(curName) || /^OpenFlux/.test(curName) || curName === '') {
       nameField.input.value = carrierPrefix + '_olcrtc' + (t && t !== 'vp8channel' ? '_' + t : '');
     }
     updateVisibility();

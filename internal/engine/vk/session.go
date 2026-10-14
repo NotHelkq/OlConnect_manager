@@ -1,0 +1,630 @@
+package vk
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/openlibrecommunity/olcrtc/internal/engine"
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
+	"github.com/pion/webrtc/v4"
+)
+
+const (
+	defaultSendQueueSize = 5000
+	maxReconnects        = 10
+	reconnectWindow      = 5 * time.Minute
+	pingInterval         = 15 * time.Second
+	writeWait            = 10 * time.Second
+)
+
+var (
+	ErrSessionClosed       = errors.New("vk session closed")
+	ErrDataChannelNotReady = errors.New("vk datachannel not ready")
+	ErrSendQueueFull       = errors.New("vk send queue full")
+	ErrNoEndpoint          = errors.New("vk signaling endpoint missing")
+)
+
+type Session struct {
+	name             string
+	endpoint         string
+	joinLink         string
+	sessionKey       string
+	applicationKey   string
+	turnURLs         []string
+	turnUsername     string
+	turnCredential   string
+	stunURLs         []string
+
+	onData          func([]byte)
+	onPeerData      func(peerID string, data []byte)
+	onReconnect     func(*webrtc.DataChannel)
+	shouldReconnect func() bool
+	onEnded         func(string)
+	refresh         func(ctx context.Context) (engine.Credentials, error)
+
+	ws    *websocket.Conn
+	wsMu  sync.Mutex
+	pc    *webrtc.PeerConnection
+	dc    *webrtc.DataChannel
+	dcMu  sync.Mutex
+
+	seq          int
+	remotePeerID *int64
+	hasRemoteDesc bool
+	pendingICE   []webrtc.ICECandidateInit
+
+	sendQueue      chan []byte
+	reconnectCh    chan struct{}
+	closeCh        chan struct{}
+	closed         atomic.Bool
+	lastReconnect  time.Time
+	reconnectCount int
+	sessionMu      sync.Mutex
+}
+
+func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
+	endpoint := cfg.URL
+	var turnURLs []string
+	var stunURLs []string
+	var turnUsername, turnCredential, sessionKey, applicationKey, joinLink string
+
+	if cfg.Extra != nil {
+		if u := cfg.Extra["endpoint"]; u != "" {
+			endpoint = u
+		}
+		sessionKey = cfg.Extra["sessionKey"]
+		applicationKey = cfg.Extra["applicationKey"]
+		joinLink = cfg.Extra["joinLink"]
+		turnUsername = cfg.Extra["turnUsername"]
+		turnCredential = cfg.Extra["turnCredential"]
+		if raw := cfg.Extra["turnURLs"]; raw != "" {
+			for _, part := range strings.Split(raw, ",") {
+				if s := strings.TrimSpace(part); s != "" {
+					turnURLs = append(turnURLs, s)
+				}
+			}
+		}
+		if raw := cfg.Extra["stunURLs"]; raw != "" {
+			for _, part := range strings.Split(raw, ",") {
+				if s := strings.TrimSpace(part); s != "" {
+					stunURLs = append(stunURLs, s)
+				}
+			}
+		}
+	}
+
+	if endpoint == "" {
+		endpoint = "wss://calls.okcdn.ru/ws"
+	}
+
+	s := &Session{
+		name:           cfg.Name,
+		endpoint:       endpoint,
+		joinLink:       joinLink,
+		sessionKey:     sessionKey,
+		applicationKey: applicationKey,
+		turnURLs:       turnURLs,
+		turnUsername:   turnUsername,
+		turnCredential: turnCredential,
+		stunURLs:       stunURLs,
+		onData:         cfg.OnData,
+		onPeerData:     cfg.OnPeerData,
+		refresh:        cfg.Refresh,
+		sendQueue:      make(chan []byte, defaultSendQueueSize),
+		reconnectCh:    make(chan struct{}, 1),
+		closeCh:        make(chan struct{}),
+	}
+
+	return s, nil
+}
+
+func (s *Session) Capabilities() engine.Capabilities {
+	return engine.Capabilities{ByteStream: true, VideoTrack: false}
+}
+
+func (s *Session) Connect(ctx context.Context) error {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+
+	logger.Infof("Connecting to VK signaling endpoint: %s", s.endpoint)
+
+	header := http.Header{}
+	header.Set("Origin", "https://vk.ru")
+	header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 15 * time.Second
+
+	ws, _, err := dialer.DialContext(ctx, s.endpoint, header)
+	if err != nil {
+		logger.Debugf("VK WS dial directly failed: %v", err)
+		// If direct dial fails, continue with best effort
+	}
+	s.ws = ws
+
+	if err := s.initPeerConnection(); err != nil {
+		return fmt.Errorf("init peer connection: %w", err)
+	}
+
+	if s.ws != nil {
+		go s.readLoop()
+		go s.sendMediaSettings()
+	}
+	go s.sendLoop()
+
+	return nil
+}
+
+func (s *Session) initPeerConnection() error {
+	var iceServers []webrtc.ICEServer
+
+	if len(s.turnURLs) > 0 {
+		urls := append([]string{}, s.turnURLs...)
+		urls = append(urls, "turn:calls.okcdn.ru:3478?transport=tcp")
+		urls = append(urls, "turns:calls.okcdn.ru:443")
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:           urls,
+			Username:       s.turnUsername,
+			Credential:     s.turnCredential,
+			CredentialType: webrtc.ICECredentialTypePassword,
+		})
+	} else {
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs: []string{
+				"stun:calls.okcdn.ru:3478",
+				"turn:calls.okcdn.ru:3478",
+				"turns:calls.okcdn.ru:443",
+			},
+		})
+	}
+
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: iceServers,
+	})
+	if err != nil {
+		return err
+	}
+	s.pc = pc
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		if s.remotePeerID != nil {
+			candJSON, _ := json.Marshal(c.ToJSON())
+			var candVal any
+			json.Unmarshal(candJSON, &candVal)
+			s.vkSend("transmit-data", map[string]any{
+				"participantId": *s.remotePeerID,
+				"data":          map[string]any{"candidate": candVal},
+			})
+		} else {
+			s.pendingICE = append(s.pendingICE, c.ToJSON())
+		}
+	})
+
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		logger.Infof("VK PeerConnection state: %s", state.String())
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
+			s.triggerReconnect("pc state: " + state.String())
+		}
+	})
+
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		logger.Infof("VK remote DataChannel received: %s (id: %v)", dc.Label(), dc.ID())
+		s.setupDataChannel(dc)
+	})
+
+	ordered := true
+	maxRetransmits := uint16(0)
+	localDC, err := pc.CreateDataChannel("data", &webrtc.DataChannelInit{
+		Ordered:        &ordered,
+		MaxRetransmits: &maxRetransmits,
+	})
+	if err == nil {
+		s.setupDataChannel(localDC)
+	}
+
+	return nil
+}
+
+func (s *Session) setupDataChannel(dc *webrtc.DataChannel) {
+	s.dcMu.Lock()
+	s.dc = dc
+	s.dcMu.Unlock()
+
+	dc.OnOpen(func() {
+		logger.Infof("VK DataChannel opened: %s", dc.Label())
+		if s.onReconnect != nil {
+			s.onReconnect(dc)
+		}
+	})
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if s.onData != nil && len(msg.Data) > 0 {
+			s.onData(msg.Data)
+		}
+	})
+
+	dc.OnClose(func() {
+		logger.Infof("VK DataChannel closed: %s", dc.Label())
+	})
+}
+
+func (s *Session) sendMediaSettings() {
+	s.vkSend("update-media-modifiers", map[string]any{
+		"mediaModifiers": map[string]any{"denoise": true, "denoiseAnn": true},
+	})
+	s.vkSend("change-media-settings", map[string]any{
+		"mediaSettings": map[string]any{
+			"isAudioEnabled": false, "isVideoEnabled": true, "isScreenSharingEnabled": false,
+		},
+	})
+}
+
+func (s *Session) readLoop() {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-s.closeCh:
+				return
+			case <-ticker.C:
+				s.wsMu.Lock()
+				if s.ws != nil {
+					_ = s.ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(writeWait))
+				}
+				s.wsMu.Unlock()
+			}
+		}
+	}()
+
+	for {
+		if s.closed.Load() {
+			return
+		}
+		s.wsMu.Lock()
+		ws := s.ws
+		s.wsMu.Unlock()
+		if ws == nil {
+			return
+		}
+
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			if !s.closed.Load() {
+				logger.Debugf("VK WS read error: %v", err)
+				s.triggerReconnect("ws read error")
+			}
+			return
+		}
+
+		text := string(msg)
+		if text == "ping" {
+			s.wsMu.Lock()
+			if s.ws != nil {
+				_ = s.ws.WriteMessage(websocket.TextMessage, []byte("pong"))
+			}
+			s.wsMu.Unlock()
+			continue
+		}
+
+		var data map[string]any
+		if err := json.Unmarshal(msg, &data); err != nil {
+			continue
+		}
+
+		s.handleSignalingMessage(data)
+	}
+}
+
+func (s *Session) handleSignalingMessage(data map[string]any) {
+	msgType, _ := data["type"].(string)
+
+	switch msgType {
+	case "registered-peer":
+		if pid, ok := data["participantId"].(float64); ok {
+			id := int64(pid)
+			s.remotePeerID = &id
+			logger.Infof("VK remote peer registered: %d", id)
+			s.createAndSendOffer()
+		}
+
+	case "transmit-data":
+		innerData, ok := data["data"].(map[string]any)
+		if !ok {
+			return
+		}
+
+		if cand, ok := innerData["candidate"]; ok {
+			candJSON, _ := json.Marshal(cand)
+			var candInit webrtc.ICECandidateInit
+			if json.Unmarshal(candJSON, &candInit) == nil && s.pc != nil {
+				_ = s.pc.AddICECandidate(candInit)
+			}
+		}
+
+		if sdpMap, ok := innerData["sdp"].(map[string]any); ok {
+			sdpType, _ := sdpMap["type"].(string)
+			sdpStr, _ := sdpMap["sdp"].(string)
+			s.handleSDP(sdpType, sdpStr)
+		}
+	}
+}
+
+func (s *Session) createAndSendOffer() {
+	if s.pc == nil || s.remotePeerID == nil {
+		return
+	}
+	offer, err := s.pc.CreateOffer(nil)
+	if err != nil {
+		logger.Debugf("VK create offer error: %v", err)
+		return
+	}
+	if err := s.pc.SetLocalDescription(offer); err != nil {
+		logger.Debugf("VK set local description error: %v", err)
+		return
+	}
+
+	s.vkSend("transmit-data", map[string]any{
+		"participantId": *s.remotePeerID,
+		"data": map[string]any{
+			"sdp": map[string]any{
+				"type": offer.Type.String(),
+				"sdp":  offer.SDP,
+			},
+		},
+	})
+	logger.Infof("VK Offer sent to peer %d", *s.remotePeerID)
+}
+
+func (s *Session) handleSDP(sdpType, sdpStr string) {
+	if s.pc == nil {
+		return
+	}
+	logger.Infof("VK received SDP %s (%d bytes)", sdpType, len(sdpStr))
+
+	if sdpType == "offer" {
+		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  sdpStr,
+		}); err != nil {
+			logger.Debugf("VK set remote offer error: %v", err)
+			return
+		}
+		s.hasRemoteDesc = true
+		s.flushPendingICE()
+
+		answer, err := s.pc.CreateAnswer(nil)
+		if err != nil {
+			logger.Debugf("VK create answer error: %v", err)
+			return
+		}
+		if err := s.pc.SetLocalDescription(answer); err != nil {
+			logger.Debugf("VK set local answer error: %v", err)
+			return
+		}
+
+		if s.remotePeerID != nil {
+			s.vkSend("transmit-data", map[string]any{
+				"participantId": *s.remotePeerID,
+				"data": map[string]any{
+					"sdp": map[string]any{
+						"type": answer.Type.String(),
+						"sdp":  answer.SDP,
+					},
+				},
+			})
+			logger.Infof("VK Answer sent to peer %d", *s.remotePeerID)
+		}
+	} else if sdpType == "answer" {
+		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeAnswer,
+			SDP:  sdpStr,
+		}); err != nil {
+			logger.Debugf("VK set remote answer error: %v", err)
+			return
+		}
+		s.hasRemoteDesc = true
+		s.flushPendingICE()
+	}
+}
+
+func (s *Session) flushPendingICE() {
+	if s.pc == nil {
+		return
+	}
+	for _, cand := range s.pendingICE {
+		_ = s.pc.AddICECandidate(cand)
+	}
+	s.pendingICE = nil
+}
+
+func (s *Session) vkSend(command string, extra map[string]any) {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.ws == nil {
+		return
+	}
+	s.seq++
+	extra["command"] = command
+	extra["sequence"] = s.seq
+	_ = s.ws.WriteJSON(extra)
+}
+
+func (s *Session) sendLoop() {
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case data, ok := <-s.sendQueue:
+			if !ok {
+				return
+			}
+			s.dcMu.Lock()
+			dc := s.dc
+			s.dcMu.Unlock()
+			if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+				_ = dc.Send(data)
+			}
+		}
+	}
+}
+
+func (s *Session) Send(data []byte) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	s.dcMu.Lock()
+	dc := s.dc
+	s.dcMu.Unlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return ErrDataChannelNotReady
+	}
+
+	select {
+	case s.sendQueue <- data:
+		return nil
+	case <-time.After(50 * time.Millisecond):
+		return ErrSendQueueFull
+	}
+}
+
+func (s *Session) CanSend() bool {
+	s.dcMu.Lock()
+	defer s.dcMu.Unlock()
+	return s.dc != nil && s.dc.ReadyState() == webrtc.DataChannelStateOpen
+}
+
+func (s *Session) GetSendQueue() chan []byte {
+	return s.sendQueue
+}
+
+func (s *Session) GetBufferedAmount() uint64 {
+	s.dcMu.Lock()
+	defer s.dcMu.Unlock()
+	if s.dc != nil {
+		return s.dc.BufferedAmount()
+	}
+	return 0
+}
+
+func (s *Session) SetReconnectCallback(cb func(*webrtc.DataChannel)) { s.onReconnect = cb }
+func (s *Session) SetShouldReconnect(fn func() bool)                { s.shouldReconnect = fn }
+func (s *Session) SetEndedCallback(cb func(string))                 { s.onEnded = cb }
+
+func (s *Session) WatchConnection(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.closeCh:
+			return
+		case <-s.reconnectCh:
+			if s.handleReconnect(ctx) {
+				return
+			}
+		}
+	}
+}
+
+func (s *Session) triggerReconnect(reason string) {
+	logger.Infof("VK reconnect triggered: %s", reason)
+	select {
+	case s.reconnectCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) Reconnect(reason string) {
+	s.triggerReconnect(reason)
+}
+
+func (s *Session) handleReconnect(ctx context.Context) bool {
+	if time.Since(s.lastReconnect) > reconnectWindow {
+		s.reconnectCount = 0
+	}
+	s.reconnectCount++
+	s.lastReconnect = time.Now()
+
+	if s.reconnectCount > maxReconnects {
+		if s.onEnded != nil {
+			s.onEnded("reconnect limit reached")
+		}
+		return true
+	}
+
+	backoff := time.Duration(s.reconnectCount) * 2 * time.Second
+	if backoff > 30*time.Second {
+		backoff = 30 * time.Second
+	}
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(backoff):
+	}
+
+	if s.refresh != nil {
+		fresh, err := s.refresh(ctx)
+		if err == nil {
+			s.endpoint = fresh.URL
+			if fresh.Extra != nil {
+				s.sessionKey = fresh.Extra["sessionKey"]
+			}
+		}
+	}
+
+	s.sessionMu.Lock()
+	if s.ws != nil {
+		_ = s.ws.Close()
+		s.ws = nil
+	}
+	if s.pc != nil {
+		_ = s.pc.Close()
+		s.pc = nil
+	}
+	s.hasRemoteDesc = false
+	s.remotePeerID = nil
+	s.pendingICE = nil
+	s.sessionMu.Unlock()
+
+	return s.Connect(ctx) != nil
+}
+
+func (s *Session) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.closeCh)
+
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if s.ws != nil {
+		_ = s.ws.Close()
+		s.ws = nil
+	}
+	if s.pc != nil {
+		_ = s.pc.Close()
+		s.pc = nil
+	}
+	return nil
+}
+
+func init() {
+	engine.Register("vk", New)
+}

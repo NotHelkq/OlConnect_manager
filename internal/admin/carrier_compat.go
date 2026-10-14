@@ -17,7 +17,7 @@ func isCarrierTransportCompatible(carrier, transport string) bool {
 	switch carrier {
 	case "telemost", "wbstream":
 		return transport == "vp8channel"
-	case "jitsi":
+	case "jitsi", "vk":
 		return transport == "datachannel"
 	case "openflux":
 		return transport == "vyandex" || transport == "yandex" || transport == "mailru" || transport == "avito" || transport == "cups" || transport == "cupsonline" || transport == "telemost" || transport == "auto"
@@ -32,7 +32,7 @@ func compatibleTransports(carrier string) []string {
 	switch carrier {
 	case "telemost", "wbstream":
 		return []string{"vp8channel"}
-	case "jitsi":
+	case "jitsi", "vk":
 		return []string{"datachannel"}
 	case "openflux":
 		return []string{"auto", "vyandex", "yandex", "mailru", "avito", "cups", "telemost"}

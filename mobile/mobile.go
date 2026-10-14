@@ -829,7 +829,7 @@ func validateCarrierTransport(carrierName, transportName string) error {
 		if transportName != defaultTransport {
 			return fmt.Errorf("%w: %s+%s", errIncompatibleCombo, carrierName, transportName)
 		}
-	case "jitsi":
+	case "jitsi", "vk":
 		if transportName != dataTransport {
 			return fmt.Errorf("%w: %s+%s", errIncompatibleCombo, carrierName, transportName)
 		}
