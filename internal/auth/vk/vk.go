@@ -44,7 +44,7 @@ func (Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials, e
 		return auth.Credentials{}, fmt.Errorf("invalid vk call link: %q", cfg.RoomURL)
 	}
 
-	info, err := Handshake(ctx, joinLink, cfg.Name, cfg.RoomURL)
+	info, err := Handshake(ctx, joinLink, cfg.Name, cfg.Token)
 	if err != nil {
 		return auth.Credentials{}, fmt.Errorf("vk handshake: %w", err)
 	}
@@ -104,7 +104,7 @@ func ExtractJoinLink(raw string) string {
 }
 
 // Handshake contacts calls.okcdn.ru and retrieves the signaling endpoint and TURN credentials.
-func Handshake(ctx context.Context, joinLink, displayName, rawRoomURL string) (*HandshakeInfo, error) {
+func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie string) (*HandshakeInfo, error) {
 	client := protect.NewHTTPClient()
 	client.Timeout = 15 * time.Second
 
@@ -129,15 +129,100 @@ func Handshake(ctx context.Context, joinLink, displayName, rawRoomURL string) (*
 	}
 
 	appKey := defaultAppKey
+	var okAuthToken string
 
-	// Step 1: Login to OK calls API
+	// Path A: Authenticated user mode via cookie or web_token
+	tokenStr := strings.TrimSpace(userTokenOrCookie)
+	if tokenStr != "" {
+		var vkAccessToken string
+
+		if strings.HasPrefix(tokenStr, "vk1.a.") {
+			vkAccessToken = tokenStr
+		} else {
+			// Format cookie string
+			cookieStr := tokenStr
+			if !strings.Contains(cookieStr, "=") {
+				cookieStr = "remixsid=" + cookieStr
+			}
+			logger.Infof("VK Auth: requesting web_token with cookie...")
+			webTokBytes, err := httpPost("https://login.vk.ru/?act=web_token", url.Values{
+				"version": {"1"},
+				"app_id":  {defaultAppID},
+			}, map[string]string{
+				"Cookie": cookieStr,
+			})
+			if err == nil {
+				var webTok struct {
+					Data struct {
+						AccessToken string `json:"access_token"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(webTokBytes, &webTok) == nil && webTok.Data.AccessToken != "" {
+					vkAccessToken = webTok.Data.AccessToken
+					logger.Infof("VK Auth: successfully obtained fresh web_token for server IP")
+				} else {
+					logger.Debugf("VK Auth: web_token response: %s", string(webTokBytes))
+				}
+			}
+		}
+
+		if vkAccessToken != "" {
+			// Get public key
+			settingsBytes, err := httpPost("https://api.vk.ru/method/calls.getSettings", url.Values{
+				"v": {defaultAPIVersion},
+			}, map[string]string{
+				"Authorization": "Bearer " + vkAccessToken,
+			})
+			if err == nil {
+				var settings struct {
+					Response struct {
+						Settings struct {
+							PublicKey string `json:"public_key"`
+						} `json:"settings"`
+					} `json:"response"`
+				}
+				if json.Unmarshal(settingsBytes, &settings) == nil && settings.Response.Settings.PublicKey != "" {
+					appKey = settings.Response.Settings.PublicKey
+				}
+			}
+
+			// Get call token
+			callTokBytes, err := httpPost("https://api.vk.ru/method/messages.getCallToken", url.Values{
+				"v":   {defaultAPIVersion},
+				"env": {"production"},
+			}, map[string]string{
+				"Authorization": "Bearer " + vkAccessToken,
+			})
+			if err == nil {
+				var callTok struct {
+					Response struct {
+						Token      string `json:"token"`
+						APIBaseURL string `json:"api_base_url"`
+					} `json:"response"`
+				}
+				if json.Unmarshal(callTokBytes, &callTok) == nil && callTok.Response.Token != "" {
+					okAuthToken = callTok.Response.Token
+					logger.Infof("VK Auth: successfully acquired call token")
+				} else {
+					logger.Debugf("VK Auth: messages.getCallToken response: %s", string(callTokBytes))
+				}
+			}
+		}
+	}
+
+	// Step 2: Login to OK calls API
 	deviceID := fmt.Sprintf("%d", rand.Int63n(9e18))
-	sessionData, _ := json.Marshal(map[string]interface{}{
+	sdMap := map[string]any{
 		"version":        2,
 		"device_id":      deviceID,
 		"client_version": defaultAppVersion,
 		"client_type":    "SDK_JS",
-	})
+	}
+	if okAuthToken != "" {
+		sdMap["version"] = 3
+		sdMap["auth_token"] = okAuthToken
+	}
+	sessionData, _ := json.Marshal(sdMap)
 
 	loginRespBytes, err := httpPost("https://calls.okcdn.ru/fb.do", url.Values{
 		"method":          {"auth.anonymLogin"},
@@ -157,43 +242,45 @@ func Handshake(ctx context.Context, joinLink, displayName, rawRoomURL string) (*
 	}
 	sessionKey := loginResp.SessionKey
 
-	// Step 2: Try to get anonymToken from VK API if possible
+	// Step 3: Try to get anonymToken from VK API if not authorized session
 	var anonymToken string
-	anonRespBytes, err := httpPost("https://login.vk.ru/?act=get_anonym_token", url.Values{
-		"client_id": {defaultAppID},
-	}, nil)
-	if err == nil {
-		var anonResp struct {
-			Data struct {
-				AccessToken string `json:"access_token"`
-			} `json:"data"`
-		}
-		if json.Unmarshal(anonRespBytes, &anonResp) == nil && anonResp.Data.AccessToken != "" {
-			name := displayName
-			if name == "" {
-				name = "Tester"
+	if okAuthToken == "" {
+		anonRespBytes, err := httpPost("https://login.vk.ru/?act=get_anonym_token", url.Values{
+			"client_id": {defaultAppID},
+		}, nil)
+		if err == nil {
+			var anonResp struct {
+				Data struct {
+					AccessToken string `json:"access_token"`
+				} `json:"data"`
 			}
-			callRespBytes, err := httpPost("https://api.vk.ru/method/calls.getAnonymousToken", url.Values{
-				"v":            {defaultAPIVersion},
-				"vk_join_link": {"https://vk.ru/call/join/" + joinLink},
-				"name":         {name},
-			}, map[string]string{
-				"Authorization": "Bearer " + anonResp.Data.AccessToken,
-			})
-			if err == nil {
-				var callResp struct {
-					Response struct {
-						Token string `json:"token"`
-					} `json:"response"`
+			if json.Unmarshal(anonRespBytes, &anonResp) == nil && anonResp.Data.AccessToken != "" {
+				name := displayName
+				if name == "" {
+					name = "Tester"
 				}
-				if json.Unmarshal(callRespBytes, &callResp) == nil {
-					anonymToken = callResp.Response.Token
+				callRespBytes, err := httpPost("https://api.vk.ru/method/calls.getAnonymousToken", url.Values{
+					"v":            {defaultAPIVersion},
+					"vk_join_link": {"https://vk.ru/call/join/" + joinLink},
+					"name":         {name},
+				}, map[string]string{
+					"Authorization": "Bearer " + anonResp.Data.AccessToken,
+				})
+				if err == nil {
+					var callResp struct {
+						Response struct {
+							Token string `json:"token"`
+						} `json:"response"`
+					}
+					if json.Unmarshal(callRespBytes, &callResp) == nil {
+						anonymToken = callResp.Response.Token
+					}
 				}
 			}
 		}
 	}
 
-	// Step 3: Join conversation by link
+	// Step 4: Join conversation by link
 	mediaSettings, _ := json.Marshal(map[string]bool{
 		"isAudioEnabled":         false,
 		"isVideoEnabled":         true,
@@ -239,8 +326,6 @@ func Handshake(ctx context.Context, joinLink, displayName, rawRoomURL string) (*
 	}
 
 	if joinResp.ErrorCode != 0 && joinResp.Endpoint == "" {
-		logger.Debugf("VK join error: %d %s", joinResp.ErrorCode, joinResp.ErrorMsg)
-		// If direct join requires token/auth, return structured error
 		return nil, fmt.Errorf("vk join error %d: %s", joinResp.ErrorCode, joinResp.ErrorMsg)
 	}
 

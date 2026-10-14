@@ -45,6 +45,8 @@ type Config struct {
 	RoomURL string
 	// Name is the display name to register with.
 	Name string
+	// Token is the optional user/moderator/account token or cookie.
+	Token string
 	// DNSServer / ProxyAddr / ProxyPort are network knobs for outbound HTTP.
 	DNSServer string
 	ProxyAddr string
