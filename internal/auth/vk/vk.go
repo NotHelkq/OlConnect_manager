@@ -154,6 +154,16 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 
 	// Path A: Authenticated user mode via cookie or web_token
 	tokenStr := strings.TrimSpace(userTokenOrCookie)
+	if idx := strings.Index(tokenStr, "access_token="); idx >= 0 {
+		val := tokenStr[idx+len("access_token="):]
+		for i, r := range val {
+			if r == '&' || r == '#' || r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+				val = val[:i]
+				break
+			}
+		}
+		tokenStr = strings.TrimSpace(val)
+	}
 	if tokenStr == "" {
 		if data, err := os.ReadFile("/etc/olcrtc/vk_cookies"); err == nil && len(data) > 0 {
 			tokenStr = strings.TrimSpace(string(data))
