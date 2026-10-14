@@ -56,10 +56,11 @@ type Session struct {
 	dc    *webrtc.DataChannel
 	dcMu  sync.Mutex
 
-	seq          int
-	remotePeerID *int64
-	hasRemoteDesc bool
-	pendingICE   []webrtc.ICECandidateInit
+	seq              int
+	remotePeerID     *int64
+	hasRemoteDesc    bool
+	pendingLocalICE  []any
+	pendingRemoteICE []webrtc.ICECandidateInit
 
 	sendQueue      chan []byte
 	reconnectCh    chan struct{}
@@ -138,6 +139,16 @@ func (s *Session) Connect(ctx context.Context) error {
 		return ErrSessionClosed
 	}
 
+	endpoint := s.endpoint
+	if !strings.Contains(endpoint, "appVersion=") {
+		sep := "&"
+		if !strings.Contains(endpoint, "?") {
+			sep = "?"
+		}
+		endpoint = fmt.Sprintf("%s%sappVersion=1.127.0&device=0&version=2", endpoint, sep)
+	}
+	s.endpoint = endpoint
+
 	logger.Infof("Connecting to VK signaling endpoint: %s", s.endpoint)
 
 	header := http.Header{}
@@ -149,8 +160,8 @@ func (s *Session) Connect(ctx context.Context) error {
 
 	ws, _, err := dialer.DialContext(ctx, s.endpoint, header)
 	if err != nil {
-		logger.Debugf("VK WS dial directly failed: %v", err)
-		// If direct dial fails, continue with best effort
+		logger.Errorf("VK WS dial directly failed: %v", err)
+		return fmt.Errorf("vk ws dial: %w", err)
 	}
 	s.ws = ws
 
@@ -202,16 +213,19 @@ func (s *Session) initPeerConnection() error {
 		if c == nil {
 			return
 		}
+		candJSON, _ := json.Marshal(c.ToJSON())
+		var candVal any
+		_ = json.Unmarshal(candJSON, &candVal)
+
+		s.sessionMu.Lock()
+		defer s.sessionMu.Unlock()
 		if s.remotePeerID != nil {
-			candJSON, _ := json.Marshal(c.ToJSON())
-			var candVal any
-			json.Unmarshal(candJSON, &candVal)
 			s.vkSend("transmit-data", map[string]any{
 				"participantId": *s.remotePeerID,
 				"data":          map[string]any{"candidate": candVal},
 			})
 		} else {
-			s.pendingICE = append(s.pendingICE, c.ToJSON())
+			s.pendingLocalICE = append(s.pendingLocalICE, candVal)
 		}
 	})
 
@@ -307,7 +321,7 @@ func (s *Session) readLoop() {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
 			if !s.closed.Load() {
-				logger.Debugf("VK WS read error: %v", err)
+				logger.Errorf("VK WS read error: %v", err)
 				s.triggerReconnect("ws read error")
 			}
 			return
@@ -334,17 +348,32 @@ func (s *Session) readLoop() {
 
 func (s *Session) handleSignalingMessage(data map[string]any) {
 	msgType, _ := data["type"].(string)
+	eventName := msgType
+	if n, ok := data["notification"].(string); ok && n != "" {
+		eventName = n
+	}
 
-	switch msgType {
+	switch eventName {
 	case "registered-peer":
 		if pid, ok := data["participantId"].(float64); ok {
 			id := int64(pid)
+			s.sessionMu.Lock()
 			s.remotePeerID = &id
+			s.sessionMu.Unlock()
 			logger.Infof("VK remote peer registered: %d", id)
 			s.createAndSendOffer()
 		}
 
-	case "transmit-data":
+	case "transmitted-data", "transmit-data":
+		if pid, ok := data["participantId"].(float64); ok {
+			s.sessionMu.Lock()
+			if s.remotePeerID == nil {
+				id := int64(pid)
+				s.remotePeerID = &id
+			}
+			s.sessionMu.Unlock()
+		}
+
 		innerData, ok := data["data"].(map[string]any)
 		if !ok {
 			return
@@ -354,7 +383,13 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			candJSON, _ := json.Marshal(cand)
 			var candInit webrtc.ICECandidateInit
 			if json.Unmarshal(candJSON, &candInit) == nil && s.pc != nil {
-				_ = s.pc.AddICECandidate(candInit)
+				s.sessionMu.Lock()
+				if s.hasRemoteDesc {
+					_ = s.pc.AddICECandidate(candInit)
+				} else {
+					s.pendingRemoteICE = append(s.pendingRemoteICE, candInit)
+				}
+			s.sessionMu.Unlock()
 			}
 		}
 
@@ -363,10 +398,24 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			sdpStr, _ := sdpMap["sdp"].(string)
 			s.handleSDP(sdpType, sdpStr)
 		}
+
+	case "participant-left", "hungup":
+		if pid, ok := data["participantId"].(float64); ok {
+			id := int64(pid)
+			logger.Infof("VK peer %d left", id)
+			s.sessionMu.Lock()
+			if s.remotePeerID != nil && *s.remotePeerID == id {
+				s.remotePeerID = nil
+			}
+			s.sessionMu.Unlock()
+		}
 	}
 }
 
 func (s *Session) createAndSendOffer() {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
 	if s.pc == nil || s.remotePeerID == nil {
 		return
 	}
@@ -390,9 +439,20 @@ func (s *Session) createAndSendOffer() {
 		},
 	})
 	logger.Infof("VK Offer sent to peer %d", *s.remotePeerID)
+
+	for _, cand := range s.pendingLocalICE {
+		s.vkSend("transmit-data", map[string]any{
+			"participantId": *s.remotePeerID,
+			"data":          map[string]any{"candidate": cand},
+		})
+	}
+	s.pendingLocalICE = nil
 }
 
 func (s *Session) handleSDP(sdpType, sdpStr string) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
 	if s.pc == nil {
 		return
 	}
@@ -407,7 +467,7 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 			return
 		}
 		s.hasRemoteDesc = true
-		s.flushPendingICE()
+		s.flushPendingRemoteICE()
 
 		answer, err := s.pc.CreateAnswer(nil)
 		if err != nil {
@@ -440,18 +500,18 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 			return
 		}
 		s.hasRemoteDesc = true
-		s.flushPendingICE()
+		s.flushPendingRemoteICE()
 	}
 }
 
-func (s *Session) flushPendingICE() {
+func (s *Session) flushPendingRemoteICE() {
 	if s.pc == nil {
 		return
 	}
-	for _, cand := range s.pendingICE {
+	for _, cand := range s.pendingRemoteICE {
 		_ = s.pc.AddICECandidate(cand)
 	}
-	s.pendingICE = nil
+	s.pendingRemoteICE = nil
 }
 
 func (s *Session) vkSend(command string, extra map[string]any) {
@@ -599,7 +659,8 @@ func (s *Session) handleReconnect(ctx context.Context) bool {
 	}
 	s.hasRemoteDesc = false
 	s.remotePeerID = nil
-	s.pendingICE = nil
+	s.pendingLocalICE = nil
+	s.pendingRemoteICE = nil
 	s.sessionMu.Unlock()
 
 	return s.Connect(ctx) != nil

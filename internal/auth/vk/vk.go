@@ -1,6 +1,7 @@
 package vk
 
 import (
+	"os"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -105,6 +106,10 @@ func ExtractJoinLink(raw string) string {
 
 // Handshake contacts calls.okcdn.ru and retrieves the signaling endpoint and TURN credentials.
 func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie string) (*HandshakeInfo, error) {
+	logger.Infof("VK Handshake: joinLink=%s displayName=%s tokenLen=%d tokenStart=%q", joinLink, displayName, len(userTokenOrCookie), func() string {
+		if len(userTokenOrCookie) > 15 { return userTokenOrCookie[:15] }
+		return userTokenOrCookie
+	}())
 	client := protect.NewHTTPClient()
 	client.Timeout = 15 * time.Second
 
@@ -133,6 +138,12 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 
 	// Path A: Authenticated user mode via cookie or web_token
 	tokenStr := strings.TrimSpace(userTokenOrCookie)
+	if tokenStr == "" {
+		if data, err := os.ReadFile("/etc/olcrtc/vk_cookies"); err == nil && len(data) > 0 {
+			tokenStr = strings.TrimSpace(string(data))
+			logger.Infof("VK Auth: loaded fallback cookies from /etc/olcrtc/vk_cookies")
+		}
+	}
 	if tokenStr != "" {
 		var vkAccessToken string
 
@@ -205,6 +216,46 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 					logger.Infof("VK Auth: successfully acquired call token")
 				} else {
 					logger.Debugf("VK Auth: messages.getCallToken response: %s", string(callTokBytes))
+				}
+			}
+		}
+
+		if okAuthToken == "" && strings.HasPrefix(tokenStr, "vk1.a.") {
+			if data, err := os.ReadFile("/etc/olcrtc/vk_cookies"); err == nil && len(data) > 0 {
+				logger.Infof("VK Auth: access_token expired or rejected, falling back to /etc/olcrtc/vk_cookies...")
+				cookieStr := strings.TrimSpace(string(data))
+				webTokBytes, err := httpPost("https://login.vk.ru/?act=web_token", url.Values{
+					"version": {"1"},
+					"app_id":  {defaultAppID},
+				}, map[string]string{
+					"Cookie": cookieStr,
+				})
+				if err == nil {
+					var webTok struct {
+						Data struct {
+							AccessToken string `json:"access_token"`
+						} `json:"data"`
+					}
+					if json.Unmarshal(webTokBytes, &webTok) == nil && webTok.Data.AccessToken != "" {
+						vkAccessToken = webTok.Data.AccessToken
+						logger.Infof("VK Auth: obtained fresh web_token from fallback cookies")
+
+						callTokBytes, _ := httpPost("https://api.vk.ru/method/messages.getCallToken", url.Values{
+							"v":   {defaultAPIVersion},
+							"env": {"production"},
+						}, map[string]string{
+							"Authorization": "Bearer " + vkAccessToken,
+						})
+						var callTok struct {
+							Response struct {
+								Token string `json:"token"`
+							} `json:"response"`
+						}
+						if json.Unmarshal(callTokBytes, &callTok) == nil && callTok.Response.Token != "" {
+							okAuthToken = callTok.Response.Token
+							logger.Infof("VK Auth: successfully acquired call token using fallback")
+						}
+					}
 				}
 			}
 		}
