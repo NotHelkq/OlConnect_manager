@@ -218,12 +218,17 @@ func (c *Client) bringUpLink(
 	cfg Config,
 	cancel context.CancelFunc,
 ) error {
+	token := cfg.Token
+	if token == "" {
+		token = cfg.AuthToken
+	}
+
 	ln, err := transport.New(ctx, cfg.Transport, transport.Config{
 		Carrier:   cfg.Carrier,
 		RoomURL:   cfg.RoomURL,
 		Engine:    cfg.Engine,
 		URL:       cfg.URL,
-		Token:     cfg.Token,
+		Token:     token,
 		ChannelID: cfg.ChannelID,
 		DeviceID:  c.deviceID,
 		Name:      names.Generate(),

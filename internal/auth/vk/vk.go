@@ -45,7 +45,22 @@ func (Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials, e
 		return auth.Credentials{}, fmt.Errorf("invalid vk call link: %q", cfg.RoomURL)
 	}
 
-	info, err := Handshake(ctx, joinLink, cfg.Name, cfg.Token)
+	token := strings.TrimSpace(cfg.Token)
+	if token == "" {
+		if u, err := url.Parse(cfg.RoomURL); err == nil {
+			if q := u.Query().Get("token"); q != "" {
+				token = q
+			} else if q := u.Query().Get("call_token"); q != "" {
+				token = q
+			} else if q := u.Query().Get("auth_token"); q != "" {
+				token = q
+			} else if q := u.Query().Get("rp"); q != "" {
+				token = q
+			}
+		}
+	}
+
+	info, err := Handshake(ctx, joinLink, cfg.Name, token)
 	if err != nil {
 		return auth.Credentials{}, fmt.Errorf("vk handshake: %w", err)
 	}
@@ -135,6 +150,7 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 
 	appKey := defaultAppKey
 	var okAuthToken string
+	var vkAccessToken string
 
 	// Path A: Authenticated user mode via cookie or web_token
 	tokenStr := strings.TrimSpace(userTokenOrCookie)
@@ -145,7 +161,10 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 		}
 	}
 	if tokenStr != "" {
-		var vkAccessToken string
+		if strings.HasPrefix(tokenStr, "$") {
+			okAuthToken = tokenStr
+			logger.Infof("VK Auth: using direct call token")
+		} else {
 
 		if strings.HasPrefix(tokenStr, "vk1.a.") {
 			vkAccessToken = tokenStr
@@ -218,6 +237,8 @@ func Handshake(ctx context.Context, joinLink, displayName, userTokenOrCookie str
 					logger.Debugf("VK Auth: messages.getCallToken response: %s", string(callTokBytes))
 				}
 			}
+		}
+
 		}
 
 		if okAuthToken == "" && strings.HasPrefix(tokenStr, "vk1.a.") {
