@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ type Session struct {
 	reconnectCh    chan struct{}
 	closeCh        chan struct{}
 	closed         atomic.Bool
+	isReconnecting atomic.Bool
 	lastReconnect  time.Time
 	reconnectCount int
 	sessionMu      sync.Mutex
@@ -163,7 +165,9 @@ func (s *Session) Connect(ctx context.Context) error {
 		logger.Errorf("VK WS dial directly failed: %v", err)
 		return fmt.Errorf("vk ws dial: %w", err)
 	}
+	s.wsMu.Lock()
 	s.ws = ws
+	s.wsMu.Unlock()
 
 	if err := s.initPeerConnection(); err != nil {
 		return fmt.Errorf("init peer connection: %w", err)
@@ -192,7 +196,7 @@ func (s *Session) initPeerConnection() error {
 		URLs: stunList,
 	})
 
-	if len(s.turnURLs) > 0 && s.turnUsername != "" {
+	if len(s.turnURLs) > 0 {
 		iceServers = append(iceServers, webrtc.ICEServer{
 			URLs:           s.turnURLs,
 			Username:       s.turnUsername,
@@ -201,12 +205,19 @@ func (s *Session) initPeerConnection() error {
 		})
 	}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers:   iceServers,
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
-	})
-	if err != nil {
+	cfg := webrtc.Configuration{
+		ICEServers: iceServers,
+	}
+
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
 		return err
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+
+	pc, err := api.NewPeerConnection(cfg)
+	if err != nil {
+		return fmt.Errorf("create peer connection: %w", err)
 	}
 	s.pc = pc
 
@@ -214,10 +225,8 @@ func (s *Session) initPeerConnection() error {
 		if c == nil {
 			return
 		}
-		logger.Infof("VK local ICE candidate gathered: %s", c.ToJSON().Candidate)
-		candJSON, _ := json.Marshal(c.ToJSON())
-		var candVal any
-		_ = json.Unmarshal(candJSON, &candVal)
+		candVal := c.ToJSON()
+		logger.Infof("VK local ICE candidate gathered: %s", candVal.Candidate)
 
 		s.sessionMu.Lock()
 		defer s.sessionMu.Unlock()
@@ -234,7 +243,9 @@ func (s *Session) initPeerConnection() error {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		logger.Infof("VK PeerConnection state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
-			s.triggerReconnect("pc state: " + state.String())
+			if !s.isReconnecting.Load() && !s.closed.Load() {
+				s.triggerReconnect("pc state: " + state.String())
+			}
 		}
 	})
 
@@ -249,7 +260,9 @@ func (s *Session) initPeerConnection() error {
 		Ordered:        &ordered,
 		MaxRetransmits: &maxRetransmits,
 	})
-	if err == nil {
+	if err != nil {
+		logger.Debugf("VK create local datachannel error: %v", err)
+	} else {
 		s.setupDataChannel(localDC)
 	}
 
@@ -269,7 +282,7 @@ func (s *Session) setupDataChannel(dc *webrtc.DataChannel) {
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if s.onData != nil && len(msg.Data) > 0 {
+		if s.onData != nil {
 			s.onData(msg.Data)
 		}
 	})
@@ -291,18 +304,30 @@ func (s *Session) sendMediaSettings() {
 }
 
 func (s *Session) readLoop() {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
+	s.wsMu.Lock()
+	ws := s.ws
+	s.wsMu.Unlock()
+	if ws == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	defer close(done)
 
 	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+
 		for {
 			select {
 			case <-s.closeCh:
 				return
+			case <-done:
+				return
 			case <-ticker.C:
 				s.wsMu.Lock()
-				if s.ws != nil {
-					_ = s.ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(writeWait))
+				if s.ws == ws {
+					_ = ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(writeWait))
 				}
 				s.wsMu.Unlock()
 			}
@@ -313,16 +338,14 @@ func (s *Session) readLoop() {
 		if s.closed.Load() {
 			return
 		}
-		s.wsMu.Lock()
-		ws := s.ws
-		s.wsMu.Unlock()
-		if ws == nil {
-			return
-		}
 
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
-			if !s.closed.Load() {
+			s.wsMu.Lock()
+			isCurrent := (s.ws == ws)
+			s.wsMu.Unlock()
+
+			if isCurrent && !s.closed.Load() && !s.isReconnecting.Load() && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
 				logger.Errorf("VK WS read error: %v", err)
 				s.triggerReconnect("ws read error")
 			}
@@ -332,8 +355,8 @@ func (s *Session) readLoop() {
 		text := string(msg)
 		if text == "ping" {
 			s.wsMu.Lock()
-			if s.ws != nil {
-				_ = s.ws.WriteMessage(websocket.TextMessage, []byte("pong"))
+			if s.ws == ws {
+				_ = ws.WriteMessage(websocket.TextMessage, []byte("pong"))
 			}
 			s.wsMu.Unlock()
 			continue
@@ -358,24 +381,15 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 	switch eventName {
 	case "registered-peer":
 		if pid, ok := data["participantId"].(float64); ok {
-			id := int64(pid)
+			peerID := int64(pid)
 			s.sessionMu.Lock()
-			s.remotePeerID = &id
+			s.remotePeerID = &peerID
 			s.sessionMu.Unlock()
-			logger.Infof("VK remote peer registered: %d", id)
-			s.createAndSendOffer()
+			logger.Infof("VK remote peer registered: %d", peerID)
+			go s.createAndSendOffer()
 		}
 
-	case "transmitted-data", "transmit-data":
-		if pid, ok := data["participantId"].(float64); ok {
-			s.sessionMu.Lock()
-			if s.remotePeerID == nil {
-				id := int64(pid)
-				s.remotePeerID = &id
-			}
-			s.sessionMu.Unlock()
-		}
-
+	case "transmit-data":
 		innerData, ok := data["data"].(map[string]any)
 		if !ok {
 			return
@@ -400,16 +414,17 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 		if sdpMap, ok := innerData["sdp"].(map[string]any); ok {
 			sdpType, _ := sdpMap["type"].(string)
 			sdpStr, _ := sdpMap["sdp"].(string)
-			s.handleSDP(sdpType, sdpStr)
+			logger.Infof("VK received SDP %s (%d bytes)", sdpType, len(sdpStr))
+			go s.handleSDP(sdpType, sdpStr)
 		}
 
-	case "participant-left", "hungup":
+	case "peer-left":
 		if pid, ok := data["participantId"].(float64); ok {
-			id := int64(pid)
-			logger.Infof("VK peer %d left", id)
+			logger.Infof("VK peer %d left", int64(pid))
 			s.sessionMu.Lock()
-			if s.remotePeerID != nil && *s.remotePeerID == id {
+			if s.remotePeerID != nil && *s.remotePeerID == int64(pid) {
 				s.remotePeerID = nil
+				s.hasRemoteDesc = false
 			}
 			s.sessionMu.Unlock()
 		}
@@ -438,7 +453,7 @@ func (s *Session) createAndSendOffer() {
 	select {
 	case <-gatherComplete:
 		logger.Infof("VK ICE gathering completed for offer")
-	case <-time.After(1500 * time.Millisecond):
+	case <-time.After(3500 * time.Millisecond):
 		logger.Infof("VK ICE gathering timeout for offer")
 	}
 
@@ -474,7 +489,6 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 	if s.pc == nil {
 		return
 	}
-	logger.Infof("VK received SDP %s (%d bytes)", sdpType, len(sdpStr))
 
 	if sdpType == "offer" {
 		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
@@ -502,7 +516,7 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 		select {
 		case <-gatherComplete:
 			logger.Infof("VK ICE gathering completed for answer")
-		case <-time.After(1500 * time.Millisecond):
+		case <-time.After(3500 * time.Millisecond):
 			logger.Infof("VK ICE gathering timeout for answer")
 		}
 
@@ -563,10 +577,19 @@ func (s *Session) vkSend(command string, extra map[string]any) {
 	if s.ws == nil {
 		return
 	}
-	s.seq++
-	extra["command"] = command
-	extra["sequence"] = s.seq
-	_ = s.ws.WriteJSON(extra)
+
+	payload := map[string]any{
+		"command": command,
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+
+	msgBytes, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = s.ws.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
 func (s *Session) sendLoop() {
@@ -582,16 +605,27 @@ func (s *Session) sendLoop() {
 			dc := s.dc
 			s.dcMu.Unlock()
 			if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-				_ = dc.Send(data)
+				if err := dc.Send(data); err != nil {
+					logger.Debugf("VK DataChannel send error: %v", err)
+				}
 			}
 		}
 	}
+}
+
+func (s *Session) SetDataCallback(cb func([]byte)) {
+	s.onData = cb
+}
+
+func (s *Session) SetPeerDataCallback(cb func(string, []byte)) {
+	s.onPeerData = cb
 }
 
 func (s *Session) Send(data []byte) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
+
 	s.dcMu.Lock()
 	dc := s.dc
 	s.dcMu.Unlock()
@@ -638,6 +672,14 @@ func (s *Session) WatchConnection(ctx context.Context) {
 		case <-s.closeCh:
 			return
 		case <-s.reconnectCh:
+			for {
+				select {
+				case <-s.reconnectCh:
+				default:
+					goto drained
+				}
+			}
+		drained:
 			if s.handleReconnect(ctx) {
 				return
 			}
@@ -658,6 +700,9 @@ func (s *Session) Reconnect(reason string) {
 }
 
 func (s *Session) handleReconnect(ctx context.Context) bool {
+	s.isReconnecting.Store(true)
+	defer s.isReconnecting.Store(false)
+
 	if time.Since(s.lastReconnect) > reconnectWindow {
 		s.reconnectCount = 0
 	}
