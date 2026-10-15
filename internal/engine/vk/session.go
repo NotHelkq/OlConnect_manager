@@ -442,7 +442,7 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			go s.createAndSendOffer()
 		}
 
-	case "transmit-data":
+	case "transmitted-data", "transmit-data":
 		if pid, ok := data["participantId"].(float64); ok {
 			peerID := int64(pid)
 			s.sessionMu.Lock()
@@ -474,14 +474,20 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			}
 		}
 
+		var sdpType, sdpStr string
 		if sdpMap, ok := innerData["sdp"].(map[string]any); ok {
-			sdpType, _ := sdpMap["type"].(string)
-			sdpStr, _ := sdpMap["sdp"].(string)
+			sdpType, _ = sdpMap["type"].(string)
+			sdpStr, _ = sdpMap["sdp"].(string)
+		} else if t, ok := innerData["type"].(string); ok {
+			sdpType = t
+			sdpStr, _ = innerData["sdp"].(string)
+		}
+		if sdpType != "" && sdpStr != "" {
 			logger.Infof("VK received SDP %s (%d bytes)", sdpType, len(sdpStr))
 			go s.handleSDP(sdpType, sdpStr)
 		}
 
-	case "peer-left":
+	case "peer-left", "hungup":
 		if pid, ok := data["participantId"].(float64); ok {
 			logger.Infof("VK peer %d left", int64(pid))
 			s.sessionMu.Lock()
