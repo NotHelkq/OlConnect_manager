@@ -36,16 +36,16 @@ var (
 )
 
 type Session struct {
-	name             string
-	endpoint         string
-	joinLink         string
-	sessionKey       string
-	applicationKey   string
-	turnURLs         []string
-	turnUsername     string
-	turnCredential   string
-	stunURLs         []string
-	selfUserID       int64
+	name           string
+	endpoint       string
+	joinLink       string
+	sessionKey     string
+	applicationKey string
+	turnURLs       []string
+	turnUsername   string
+	turnCredential string
+	stunURLs       []string
+	selfUserID     int64
 
 	onData          func([]byte)
 	onPeerData      func(peerID string, data []byte)
@@ -54,11 +54,11 @@ type Session struct {
 	onEnded         func(string)
 	refresh         func(ctx context.Context) (engine.Credentials, error)
 
-	ws    *websocket.Conn
-	wsMu  sync.Mutex
-	pc    *webrtc.PeerConnection
-	dc    *webrtc.DataChannel
-	dcMu  sync.Mutex
+	ws   *websocket.Conn
+	wsMu sync.Mutex
+	pc   *webrtc.PeerConnection
+	dc   *webrtc.DataChannel
+	dcMu sync.Mutex
 
 	seq              int
 	remotePeerID     *int64
@@ -198,13 +198,14 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) initPeerConnection() error {
 	var iceServers []webrtc.ICEServer
 
-	stunList := []string{
+	var stunList []string
+	if len(s.stunURLs) > 0 {
+		stunList = append(stunList, s.stunURLs...)
+	}
+	stunList = append(stunList,
 		"stun:stun.l.google.com:19302",
 		"stun:stun1.l.google.com:19302",
-	}
-	if len(s.stunURLs) > 0 {
-		stunList = append(s.stunURLs, stunList...)
-	}
+	)
 	iceServers = append(iceServers, webrtc.ICEServer{
 		URLs: stunList,
 	})
@@ -248,6 +249,7 @@ func (s *Session) initPeerConnection() error {
 				"participantId": *s.remotePeerID,
 				"data":          map[string]any{"candidate": candVal},
 			})
+			logger.Infof("VK sent ICE candidate to peer %d: %s", *s.remotePeerID, candVal.Candidate)
 		} else {
 			s.pendingLocalICE = append(s.pendingLocalICE, candVal)
 		}
@@ -269,9 +271,13 @@ func (s *Session) initPeerConnection() error {
 
 	ordered := true
 	maxRetransmits := uint16(0)
+	negotiated := true
+	channelID := uint16(0)
 	localDC, err := pc.CreateDataChannel("data", &webrtc.DataChannelInit{
 		Ordered:        &ordered,
 		MaxRetransmits: &maxRetransmits,
+		Negotiated:     &negotiated,
+		ID:             &channelID,
 	})
 	if err != nil {
 		logger.Debugf("VK create local datachannel error: %v", err)
@@ -401,11 +407,18 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 							peerID := int64(pid)
 							if !s.isSelf(peerID) {
 								s.sessionMu.Lock()
+								shouldOffer := false
 								if s.remotePeerID == nil {
 									s.remotePeerID = &peerID
 									logger.Infof("VK existing peer discovered in room: %d", peerID)
+									if !s.hasRemoteDesc {
+										shouldOffer = true
+									}
 								}
 								s.sessionMu.Unlock()
+								if shouldOffer {
+									go s.createAndSendOffer()
+								}
 							}
 						}
 					}
@@ -421,11 +434,18 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 						peerID := int64(pid)
 						if !s.isSelf(peerID) {
 							s.sessionMu.Lock()
+							shouldOffer := false
 							if s.remotePeerID == nil {
 								s.remotePeerID = &peerID
 								logger.Infof("VK existing peer discovered in participant-list: %d", peerID)
+								if !s.hasRemoteDesc {
+									shouldOffer = true
+								}
 							}
 							s.sessionMu.Unlock()
+							if shouldOffer {
+								go s.createAndSendOffer()
+							}
 						}
 					}
 				}
@@ -462,9 +482,15 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 		}
 
 		if cand, ok := innerData["candidate"]; ok {
-			candJSON, _ := json.Marshal(cand)
 			var candInit webrtc.ICECandidateInit
-			if json.Unmarshal(candJSON, &candInit) == nil && s.pc != nil {
+			switch v := cand.(type) {
+			case string:
+				candInit = webrtc.ICECandidateInit{Candidate: v}
+			case map[string]any:
+				candJSON, _ := json.Marshal(v)
+				_ = json.Unmarshal(candJSON, &candInit)
+			}
+			if candInit.Candidate != "" && s.pc != nil {
 				s.sessionMu.Lock()
 				if s.hasRemoteDesc {
 					err := s.pc.AddICECandidate(candInit)
@@ -505,82 +531,92 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 
 func (s *Session) createAndSendOffer() {
 	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
+	pc := s.pc
+	peerID := s.remotePeerID
+	s.sessionMu.Unlock()
 
-	if s.pc == nil || s.remotePeerID == nil {
+	if pc == nil || peerID == nil {
 		return
 	}
-	offer, err := s.pc.CreateOffer(nil)
+	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		logger.Debugf("VK create offer error: %v", err)
+		logger.Errorf("VK create offer error: %v", err)
 		return
 	}
 
-	gatherComplete := webrtc.GatheringCompletePromise(s.pc)
-	if err := s.pc.SetLocalDescription(offer); err != nil {
-		logger.Debugf("VK set local description error: %v", err)
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		logger.Errorf("VK set local description error: %v", err)
 		return
 	}
 
 	select {
 	case <-gatherComplete:
 		logger.Infof("VK ICE gathering completed for offer")
-	case <-time.After(3500 * time.Millisecond):
+	case <-time.After(7000 * time.Millisecond):
 		logger.Infof("VK ICE gathering timeout for offer")
 	}
 
-	localDesc := s.pc.LocalDescription()
+	localDesc := pc.LocalDescription()
 	if localDesc == nil {
 		localDesc = &offer
 	}
 
-	s.vkSend("transmit-data", map[string]any{
-		"participantId": *s.remotePeerID,
-		"data": map[string]any{
-			"sdp": map[string]any{
-				"type": localDesc.Type.String(),
-				"sdp":  localDesc.SDP,
-			},
-		},
-	})
-	logger.Infof("VK Offer sent to peer %d (SDP len: %d)", *s.remotePeerID, len(localDesc.SDP))
-
-	for _, cand := range s.pendingLocalICE {
+	s.sessionMu.Lock()
+	if s.remotePeerID != nil {
 		s.vkSend("transmit-data", map[string]any{
 			"participantId": *s.remotePeerID,
-			"data":          map[string]any{"candidate": cand},
+			"data": map[string]any{
+				"sdp": map[string]any{
+					"type": localDesc.Type.String(),
+					"sdp":  localDesc.SDP,
+				},
+			},
 		})
+		logger.Infof("VK Offer sent to peer %d (SDP len: %d)", *s.remotePeerID, len(localDesc.SDP))
+
+		for _, cand := range s.pendingLocalICE {
+			s.vkSend("transmit-data", map[string]any{
+				"participantId": *s.remotePeerID,
+				"data":          map[string]any{"candidate": cand},
+			})
+		}
+		s.pendingLocalICE = nil
 	}
-	s.pendingLocalICE = nil
+	s.sessionMu.Unlock()
 }
 
 func (s *Session) handleSDP(sdpType, sdpStr string) {
 	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
+	pc := s.pc
+	s.sessionMu.Unlock()
 
-	if s.pc == nil {
+	if pc == nil {
 		return
 	}
 
 	if sdpType == "offer" {
-		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer,
 			SDP:  sdpStr,
 		}); err != nil {
 			logger.Errorf("VK set remote offer error: %v", err)
 			return
 		}
+
+		s.sessionMu.Lock()
 		s.hasRemoteDesc = true
 		s.flushPendingRemoteICE()
+		s.sessionMu.Unlock()
 
-		answer, err := s.pc.CreateAnswer(nil)
+		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
 			logger.Errorf("VK create answer error: %v", err)
 			return
 		}
 
-		gatherComplete := webrtc.GatheringCompletePromise(s.pc)
-		if err := s.pc.SetLocalDescription(answer); err != nil {
+		gatherComplete := webrtc.GatheringCompletePromise(pc)
+		if err := pc.SetLocalDescription(answer); err != nil {
 			logger.Errorf("VK set local answer error: %v", err)
 			return
 		}
@@ -588,15 +624,16 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 		select {
 		case <-gatherComplete:
 			logger.Infof("VK ICE gathering completed for answer")
-		case <-time.After(3500 * time.Millisecond):
+		case <-time.After(7000 * time.Millisecond):
 			logger.Infof("VK ICE gathering timeout for answer")
 		}
 
-		localDesc := s.pc.LocalDescription()
+		localDesc := pc.LocalDescription()
 		if localDesc == nil {
 			localDesc = &answer
 		}
 
+		s.sessionMu.Lock()
 		if s.remotePeerID != nil {
 			s.vkSend("transmit-data", map[string]any{
 				"participantId": *s.remotePeerID,
@@ -608,27 +645,28 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 				},
 			})
 			logger.Infof("VK Answer sent to peer %d (SDP len: %d)", *s.remotePeerID, len(localDesc.SDP))
-		}
 
-		for _, cand := range s.pendingLocalICE {
-			if s.remotePeerID != nil {
+			for _, cand := range s.pendingLocalICE {
 				s.vkSend("transmit-data", map[string]any{
 					"participantId": *s.remotePeerID,
 					"data":          map[string]any{"candidate": cand},
 				})
 			}
+			s.pendingLocalICE = nil
 		}
-		s.pendingLocalICE = nil
+		s.sessionMu.Unlock()
 	} else if sdpType == "answer" {
-		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeAnswer,
 			SDP:  sdpStr,
 		}); err != nil {
 			logger.Errorf("VK set remote answer error: %v", err)
 			return
 		}
+		s.sessionMu.Lock()
 		s.hasRemoteDesc = true
 		s.flushPendingRemoteICE()
+		s.sessionMu.Unlock()
 	}
 }
 
@@ -709,22 +747,49 @@ func (s *Session) SetPeerDataCallback(cb func(string, []byte)) {
 	s.onPeerData = cb
 }
 
+func (s *Session) WaitForPeer(ctx context.Context) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.closeCh:
+			return ErrSessionClosed
+		case <-ticker.C:
+			s.dcMu.Lock()
+			dc := s.dc
+			s.dcMu.Unlock()
+			if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+				return nil
+			}
+		}
+	}
+}
+
 func (s *Session) Send(data []byte) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
 
-	s.dcMu.Lock()
-	dc := s.dc
-	s.dcMu.Unlock()
-	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
-		return ErrDataChannelNotReady
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.dcMu.Lock()
+		dc := s.dc
+		s.dcMu.Unlock()
+		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+			break
+		}
+		if time.Now().After(deadline) {
+			return ErrDataChannelNotReady
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	select {
 	case s.sendQueue <- data:
 		return nil
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		return ErrSendQueueFull
 	}
 }

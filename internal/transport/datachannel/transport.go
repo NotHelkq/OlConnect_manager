@@ -133,6 +133,14 @@ func (p *streamTransport) CanSend() bool {
 	return p.session.CanSend()
 }
 
+// WaitForPeer blocks until the carrier engine has established a data channel with a peer.
+func (p *streamTransport) WaitForPeer(ctx context.Context) error {
+	if waiter, ok := p.session.(transport.PeerReadyTransport); ok {
+		return waiter.WaitForPeer(ctx)
+	}
+	return nil
+}
+
 // Features describes the current datachannel transport semantics.
 func (p *streamTransport) Features() transport.Features {
 	maxPayloadSize := defaultMaxPayloadSize
