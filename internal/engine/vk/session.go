@@ -432,6 +432,9 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			}
 		}
 
+	case "error":
+		logger.Errorf("VK signaling error: %v (msg: %v)", data["error"], data["message"])
+
 	case "registered-peer":
 		if pid, ok := data["participantId"].(float64); ok {
 			peerID := int64(pid)
@@ -564,7 +567,7 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 			Type: webrtc.SDPTypeOffer,
 			SDP:  sdpStr,
 		}); err != nil {
-			logger.Debugf("VK set remote offer error: %v", err)
+			logger.Errorf("VK set remote offer error: %v", err)
 			return
 		}
 		s.hasRemoteDesc = true
@@ -572,13 +575,13 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 
 		answer, err := s.pc.CreateAnswer(nil)
 		if err != nil {
-			logger.Debugf("VK create answer error: %v", err)
+			logger.Errorf("VK create answer error: %v", err)
 			return
 		}
 
 		gatherComplete := webrtc.GatheringCompletePromise(s.pc)
 		if err := s.pc.SetLocalDescription(answer); err != nil {
-			logger.Debugf("VK set local answer error: %v", err)
+			logger.Errorf("VK set local answer error: %v", err)
 			return
 		}
 
@@ -621,7 +624,7 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 			Type: webrtc.SDPTypeAnswer,
 			SDP:  sdpStr,
 		}); err != nil {
-			logger.Debugf("VK set remote answer error: %v", err)
+			logger.Errorf("VK set remote answer error: %v", err)
 			return
 		}
 		s.hasRemoteDesc = true
@@ -647,17 +650,33 @@ func (s *Session) vkSend(command string, extra map[string]any) {
 		return
 	}
 
-	payload := map[string]any{
-		"command": command,
-	}
-	for k, v := range extra {
-		payload[k] = v
+	s.seq++
+	seq := s.seq
+
+	var msgBytes []byte
+	if pid, ok := extra["participantId"]; ok {
+		dataJSON, _ := json.Marshal(extra["data"])
+		ptype := "USER"
+		if pt, ok := extra["participantType"].(string); ok && pt != "" {
+			ptype = pt
+		}
+		msgBytes = []byte(fmt.Sprintf(`{"command":%q,"sequence":%d,"participantId":%v,"participantType":%q,"data":%s}`,
+			command, seq, pid, ptype, dataJSON))
+	} else {
+		payload := map[string]any{
+			"command":  command,
+			"sequence": seq,
+		}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		var err error
+		msgBytes, err = json.Marshal(payload)
+		if err != nil {
+			return
+		}
 	}
 
-	msgBytes, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
 	_ = s.ws.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
