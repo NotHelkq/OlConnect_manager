@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +45,7 @@ type Session struct {
 	turnUsername     string
 	turnCredential   string
 	stunURLs         []string
+	selfUserID       int64
 
 	onData          func([]byte)
 	onPeerData      func(peerID string, data []byte)
@@ -133,6 +136,10 @@ func (s *Session) Capabilities() engine.Capabilities {
 	return engine.Capabilities{ByteStream: true, VideoTrack: false}
 }
 
+func (s *Session) isSelf(peerID int64) bool {
+	return s.selfUserID != 0 && peerID == s.selfUserID
+}
+
 func (s *Session) Connect(ctx context.Context) error {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
@@ -151,7 +158,13 @@ func (s *Session) Connect(ctx context.Context) error {
 	}
 	s.endpoint = endpoint
 
-	logger.Infof("Connecting to VK signaling endpoint: %s", s.endpoint)
+	if u, err := url.Parse(s.endpoint); err == nil {
+		if uidStr := u.Query().Get("userId"); uidStr != "" {
+			s.selfUserID, _ = strconv.ParseInt(uidStr, 10, 64)
+		}
+	}
+
+	logger.Infof("Connecting to VK signaling endpoint: %s (selfUserID: %d)", s.endpoint, s.selfUserID)
 
 	header := http.Header{}
 	header.Set("Origin", "https://vk.ru")
@@ -298,7 +311,7 @@ func (s *Session) sendMediaSettings() {
 	})
 	s.vkSend("change-media-settings", map[string]any{
 		"mediaSettings": map[string]any{
-			"isAudioEnabled": false, "isVideoEnabled": true, "isScreenSharingEnabled": false,
+			"isAudioEnabled": false, "isVideoEnabled": true, "isScreenSharingEnabled": false, "isDataEnabled": true,
 		},
 	})
 }
@@ -379,6 +392,46 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 	}
 
 	switch eventName {
+	case "connection":
+		if conv, ok := data["conversation"].(map[string]any); ok {
+			if parts, ok := conv["participants"].([]any); ok {
+				for _, pAny := range parts {
+					if pMap, ok := pAny.(map[string]any); ok {
+						if pid, ok := pMap["id"].(float64); ok {
+							peerID := int64(pid)
+							if !s.isSelf(peerID) {
+								s.sessionMu.Lock()
+								if s.remotePeerID == nil {
+									s.remotePeerID = &peerID
+									logger.Infof("VK existing peer discovered in room: %d", peerID)
+								}
+								s.sessionMu.Unlock()
+							}
+						}
+					}
+				}
+			}
+		}
+
+	case "conversation-participant-list":
+		if parts, ok := data["participants"].([]any); ok {
+			for _, pAny := range parts {
+				if pMap, ok := pAny.(map[string]any); ok {
+					if pid, ok := pMap["participantId"].(float64); ok {
+						peerID := int64(pid)
+						if !s.isSelf(peerID) {
+							s.sessionMu.Lock()
+							if s.remotePeerID == nil {
+								s.remotePeerID = &peerID
+								logger.Infof("VK existing peer discovered in participant-list: %d", peerID)
+							}
+							s.sessionMu.Unlock()
+						}
+					}
+				}
+			}
+		}
+
 	case "registered-peer":
 		if pid, ok := data["participantId"].(float64); ok {
 			peerID := int64(pid)
@@ -390,6 +443,16 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 		}
 
 	case "transmit-data":
+		if pid, ok := data["participantId"].(float64); ok {
+			peerID := int64(pid)
+			s.sessionMu.Lock()
+			if s.remotePeerID == nil || *s.remotePeerID != peerID {
+				s.remotePeerID = &peerID
+				logger.Infof("VK remote peer identified from transmit-data: %d", peerID)
+			}
+			s.sessionMu.Unlock()
+		}
+
 		innerData, ok := data["data"].(map[string]any)
 		if !ok {
 			return
