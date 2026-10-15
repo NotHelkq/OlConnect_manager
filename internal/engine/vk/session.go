@@ -181,28 +181,29 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) initPeerConnection() error {
 	var iceServers []webrtc.ICEServer
 
-	if len(s.turnURLs) > 0 {
-		urls := append([]string{}, s.turnURLs...)
-		urls = append(urls, "turn:calls.okcdn.ru:3478?transport=tcp")
-		urls = append(urls, "turns:calls.okcdn.ru:443")
+	stunList := []string{
+		"stun:stun.l.google.com:19302",
+		"stun:stun1.l.google.com:19302",
+	}
+	if len(s.stunURLs) > 0 {
+		stunList = append(s.stunURLs, stunList...)
+	}
+	iceServers = append(iceServers, webrtc.ICEServer{
+		URLs: stunList,
+	})
+
+	if len(s.turnURLs) > 0 && s.turnUsername != "" {
 		iceServers = append(iceServers, webrtc.ICEServer{
-			URLs:           urls,
+			URLs:           s.turnURLs,
 			Username:       s.turnUsername,
 			Credential:     s.turnCredential,
 			CredentialType: webrtc.ICECredentialTypePassword,
 		})
-	} else {
-		iceServers = append(iceServers, webrtc.ICEServer{
-			URLs: []string{
-				"stun:calls.okcdn.ru:3478",
-				"turn:calls.okcdn.ru:3478",
-				"turns:calls.okcdn.ru:443",
-			},
-		})
 	}
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
+		ICEServers:   iceServers,
+		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
 	})
 	if err != nil {
 		return err
@@ -213,6 +214,7 @@ func (s *Session) initPeerConnection() error {
 		if c == nil {
 			return
 		}
+		logger.Infof("VK local ICE candidate gathered: %s", c.ToJSON().Candidate)
 		candJSON, _ := json.Marshal(c.ToJSON())
 		var candVal any
 		_ = json.Unmarshal(candJSON, &candVal)
@@ -385,11 +387,13 @@ func (s *Session) handleSignalingMessage(data map[string]any) {
 			if json.Unmarshal(candJSON, &candInit) == nil && s.pc != nil {
 				s.sessionMu.Lock()
 				if s.hasRemoteDesc {
-					_ = s.pc.AddICECandidate(candInit)
+					err := s.pc.AddICECandidate(candInit)
+					logger.Infof("VK added remote ICE candidate: %s (err: %v)", candInit.Candidate, err)
 				} else {
 					s.pendingRemoteICE = append(s.pendingRemoteICE, candInit)
+					logger.Infof("VK queued remote ICE candidate: %s", candInit.Candidate)
 				}
-			s.sessionMu.Unlock()
+				s.sessionMu.Unlock()
 			}
 		}
 
@@ -424,21 +428,35 @@ func (s *Session) createAndSendOffer() {
 		logger.Debugf("VK create offer error: %v", err)
 		return
 	}
+
+	gatherComplete := webrtc.GatheringCompletePromise(s.pc)
 	if err := s.pc.SetLocalDescription(offer); err != nil {
 		logger.Debugf("VK set local description error: %v", err)
 		return
+	}
+
+	select {
+	case <-gatherComplete:
+		logger.Infof("VK ICE gathering completed for offer")
+	case <-time.After(1500 * time.Millisecond):
+		logger.Infof("VK ICE gathering timeout for offer")
+	}
+
+	localDesc := s.pc.LocalDescription()
+	if localDesc == nil {
+		localDesc = &offer
 	}
 
 	s.vkSend("transmit-data", map[string]any{
 		"participantId": *s.remotePeerID,
 		"data": map[string]any{
 			"sdp": map[string]any{
-				"type": offer.Type.String(),
-				"sdp":  offer.SDP,
+				"type": localDesc.Type.String(),
+				"sdp":  localDesc.SDP,
 			},
 		},
 	})
-	logger.Infof("VK Offer sent to peer %d", *s.remotePeerID)
+	logger.Infof("VK Offer sent to peer %d (SDP len: %d)", *s.remotePeerID, len(localDesc.SDP))
 
 	for _, cand := range s.pendingLocalICE {
 		s.vkSend("transmit-data", map[string]any{
@@ -474,9 +492,23 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 			logger.Debugf("VK create answer error: %v", err)
 			return
 		}
+
+		gatherComplete := webrtc.GatheringCompletePromise(s.pc)
 		if err := s.pc.SetLocalDescription(answer); err != nil {
 			logger.Debugf("VK set local answer error: %v", err)
 			return
+		}
+
+		select {
+		case <-gatherComplete:
+			logger.Infof("VK ICE gathering completed for answer")
+		case <-time.After(1500 * time.Millisecond):
+			logger.Infof("VK ICE gathering timeout for answer")
+		}
+
+		localDesc := s.pc.LocalDescription()
+		if localDesc == nil {
+			localDesc = &answer
 		}
 
 		if s.remotePeerID != nil {
@@ -484,13 +516,23 @@ func (s *Session) handleSDP(sdpType, sdpStr string) {
 				"participantId": *s.remotePeerID,
 				"data": map[string]any{
 					"sdp": map[string]any{
-						"type": answer.Type.String(),
-						"sdp":  answer.SDP,
+						"type": localDesc.Type.String(),
+						"sdp":  localDesc.SDP,
 					},
 				},
 			})
-			logger.Infof("VK Answer sent to peer %d", *s.remotePeerID)
+			logger.Infof("VK Answer sent to peer %d (SDP len: %d)", *s.remotePeerID, len(localDesc.SDP))
 		}
+
+		for _, cand := range s.pendingLocalICE {
+			if s.remotePeerID != nil {
+				s.vkSend("transmit-data", map[string]any{
+					"participantId": *s.remotePeerID,
+					"data":          map[string]any{"candidate": cand},
+				})
+			}
+		}
+		s.pendingLocalICE = nil
 	} else if sdpType == "answer" {
 		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeAnswer,
@@ -509,7 +551,8 @@ func (s *Session) flushPendingRemoteICE() {
 		return
 	}
 	for _, cand := range s.pendingRemoteICE {
-		_ = s.pc.AddICECandidate(cand)
+		err := s.pc.AddICECandidate(cand)
+		logger.Infof("VK flushed remote ICE candidate: %s (err: %v)", cand.Candidate, err)
 	}
 	s.pendingRemoteICE = nil
 }
